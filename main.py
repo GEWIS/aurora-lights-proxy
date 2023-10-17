@@ -65,8 +65,6 @@ def main_thread():
     sio.disconnect()
 
 
-connected = False
-
 while running:
     try:
         print('Connecting...')
