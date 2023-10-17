@@ -61,6 +61,7 @@ def main_thread():
         time.sleep(1)
 
     a.stop()
+    a.blackout()
     sio.disconnect()
 
 
