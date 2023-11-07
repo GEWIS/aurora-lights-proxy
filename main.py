@@ -1,8 +1,12 @@
+import traceback
+
 from stupidArtnet import StupidArtnet
 import time
 import signal
 import requests
 import socketio
+import logging
+
 
 # Global settings
 target_ip = '169.254.0.2'		# typically in 2.x or 10.x range
@@ -21,18 +25,20 @@ def stop_execution(signum, frame):
 signal.signal(signal.SIGINT, stop_execution)
 
 
-def pad_array(arr, desired_length):
-    current_length = len(arr)
+def parse_array(arr, desired_length):
+    int_arr = [max(min(int(x), 255), 0) for x in arr]
+
+    current_length = len(int_arr)
 
     if current_length >= desired_length:
         # No need to pad, return the original array
-        return arr
+        return int_arr
     else:
         # Calculate the number of zeros to pad
         num_zeros = desired_length - current_length
 
         # Create a new array with zeros and concatenate it with the original array
-        padded_array = arr + [0] * num_zeros
+        padded_array = int_arr + [0] * num_zeros
 
         return padded_array
 
@@ -42,10 +48,11 @@ def main_thread():
     url = 'http://localhost:3000/auth/mock'
     result = requests.post(url)
     cookie = result.cookies.get('connect.sid')
-    a = StupidArtnet(target_ip, universe, packet_size, 30, True, True)
+    a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
+    print(a)
 
     sio = socketio.Client()
-    sio.connect('http://localhost:3000', headers={'cookie_development': 'connect.sid=' + cookie},
+    sio.connect('http://127.0.0.1:3000', headers={'cookie_development': 'connect.sid=' + cookie},
                 namespaces=['/lights'])
 
     a.blackout()
@@ -55,7 +62,7 @@ def main_thread():
 
     @sio.event(namespace='/lights')
     def dmx_packet(packet):
-        a.set(pad_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size])
+        a.set(parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size])
 
     while running:
         time.sleep(1)
@@ -69,6 +76,7 @@ while running:
     try:
         print('Connecting...')
         main_thread()
-    except:
+    except Exception as e:
+        logging.error(traceback.format_exc())
         print('Something went wrong. Try again...')
         time.sleep(5)
