@@ -1,5 +1,6 @@
+import os
 import traceback
-
+from dotenv import load_dotenv
 from stupidArtnet import StupidArtnet
 import time
 import signal
@@ -7,6 +8,7 @@ import requests
 import socketio
 import logging
 
+load_dotenv()
 
 # Global settings
 target_ip = '169.254.0.2'		# typically in 2.x or 10.x range
@@ -45,15 +47,24 @@ def parse_array(arr, desired_length):
 
 def main_thread():
     global running
-    url = 'http://localhost:3000/auth/mock'
-    result = requests.post(url)
+
+    url = os.environ['URL'] + '/api/auth/key'
+    result = requests.post(url, {'key': os.environ['API_KEY']})
+
+    if result.status_code != 200:
+        json = result.json()
+        raise Exception("Could not authenticate with core: [HTTP {}]: {}".format(
+            result.status_code,
+            json['details'] if json['details'] else json['message']),
+        )
+
     cookie = result.cookies.get('connect.sid')
     a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
     print(a)
 
     sio = socketio.Client()
-    sio.connect('http://127.0.0.1:3000', headers={'cookie_development': 'connect.sid=' + cookie},
-                namespaces=['/lights'])
+    sio.connect('http://127.0.0.1:3000', headers={'cookie': 'connect.sid=' + cookie},
+                namespaces=['/', '/lights'])
 
     a.blackout()
     a.start()
@@ -61,6 +72,7 @@ def main_thread():
     print('Start listening...')
 
     @sio.event(namespace='/lights')
+    @sio.event(namespace='/')
     def dmx_packet(packet):
         a.set(parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size])
 
