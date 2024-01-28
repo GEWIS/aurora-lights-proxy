@@ -19,6 +19,8 @@ packet_size = 512								# it is not necessary to send whole universe
 
 # Stop thread when necessary
 running = True
+# SocketIO exception
+crashed = False
 def stop_execution(signum, frame):
     global running
     running = False
@@ -46,7 +48,9 @@ def parse_array(arr, desired_length):
 
 
 def main_thread():
-    global running
+    global running, crashed
+
+    crashed = False
 
     url = os.environ['URL'] + '/api/auth/key'
     result = requests.post(url, {'key': os.environ['API_KEY']})
@@ -76,7 +80,14 @@ def main_thread():
     def dmx_packet(packet):
         a.set(parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size])
 
-    while running:
+    @sio.event(namespace='/')
+    @sio.event(namespace='/lights')
+    def disconnect():
+        global crashed
+        crashed = True
+        raise Exception('Socket disconnect')
+
+    while running and not crashed:
         time.sleep(1)
 
     a.stop()
