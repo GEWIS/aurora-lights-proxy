@@ -67,7 +67,7 @@ def main_thread():
     print(a)
 
     sio = socketio.Client()
-    sio.connect('http://127.0.0.1:3000', headers={'cookie': 'connect.sid=' + cookie},
+    sio.connect(os.environ['URL'], headers={'cookie': 'connect.sid=' + cookie},
                 namespaces=['/', '/lights'])
 
     a.blackout()
