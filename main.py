@@ -9,12 +9,12 @@ import socketio
 import logging
 from datetime import datetime
 
+load_dotenv()
+
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)-8s %(message)s',
     level=os.environ['LOG_LEVEL'],
     datefmt='%Y-%m-%d %H:%M:%S')
-
-load_dotenv()
 
 # Global settings
 target_ip = '169.254.0.2'		# typically in 2.x or 10.x range
