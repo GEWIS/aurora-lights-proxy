@@ -14,9 +14,10 @@ this, make sure you also change it in `main.py`.
 - Create a virtual environment `python -m venv venv`.
 - Activate the virtual environment `./venv/Scripts/activate.bat` or `./venv/Scripts/activate`.
 - Install requirements `pip install -r requirements.txt`.
-- Copy `.env.example` to `.env` and set the URL and authentication key.
+- Copy `.env.example` to `.env` and set the URL and API Key.
 - Start the script `python main.py`.
 
 When you start the script, make sure the Artnet controller is connected to the host machine. Otherwise, you might get
 a lot of socket connection errors. Note that these are probably from the connection to the Artnet controller and not
-from the connection with the core.
+from the connection with the core. In `main.py`, some more global settings can be found. These settings are tailored
+to the situation of GEWIS (with a Showtec NET-2/3 Pocket), but feel free to change these variables to your own needs.

@@ -11,7 +11,7 @@ from datetime import datetime
 
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)-8s %(message)s',
-    level=logging.DEBUG,
+    level=os.environ['LOG_LEVEL'],
     datefmt='%Y-%m-%d %H:%M:%S')
 
 load_dotenv()
