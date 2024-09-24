@@ -7,6 +7,12 @@ import signal
 import requests
 import socketio
 import logging
+from datetime import datetime
+
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)-8s %(message)s',
+    level=logging.DEBUG,
+    datefmt='%Y-%m-%d %H:%M:%S')
 
 load_dotenv()
 
@@ -26,7 +32,12 @@ def stop_execution(signum, frame):
     running = False
 
 
+# When receiving an EXIT signal, try to stop the execution flow
 signal.signal(signal.SIGINT, stop_execution)
+
+# Logging variables to track the incoming packets
+last_packet = datetime(2020, 7, 1)
+packets_since = 0
 
 
 def parse_array(arr, desired_length):
@@ -64,21 +75,39 @@ def main_thread():
 
     cookie = result.cookies.get('connect.sid')
     a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
-    print(a)
+    logging.info(a)
 
     sio = socketio.Client()
     sio.connect(os.environ['URL'], headers={'cookie': 'connect.sid=' + cookie},
                 namespaces=['/', '/lights'])
 
+    # When connecting, always return all lights to black to return to the initial state
     a.blackout()
     a.start()
-
-    print('Start listening...')
+    logging.info('Start listening...')
 
     @sio.event(namespace='/lights')
     @sio.event(namespace='/')
     def dmx_packet(packet):
-        a.set(parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size])
+        global packets_since, last_packet
+
+        parsed_packet = parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size]
+        packets_since = packets_since + 1
+
+        a.set(parsed_packet)
+
+        # Logging/debugging time
+        now = datetime.now()
+        diff = now - last_packet
+        if diff.total_seconds() > 1:
+            first_fixture = parsed_packet[:16]
+            p = packets_since
+            logging.debug(f"Received {p:02} DMX packets since last log (last packet snippet: {first_fixture})"
+                          .format(p=p, first_fixture=first_fixture))
+
+            # Reset logging variables
+            packets_since = 0
+            last_packet = now
 
     @sio.event(namespace='/')
     @sio.event(namespace='/lights')
@@ -97,9 +126,9 @@ def main_thread():
 
 while running:
     try:
-        print('Connecting...')
+        logging.info('Connecting...')
         main_thread()
     except Exception as e:
         logging.error(traceback.format_exc())
-        print('Something went wrong. Try again...')
+        logging.info('Something went wrong. Try again...')
         time.sleep(5)
