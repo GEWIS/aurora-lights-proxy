@@ -91,7 +91,7 @@ def main_thread():
     def dmx_packet(packet):
         global packets_since, last_packet
 
-        parsed_packet = parse_array(packet + packet + packet + packet + packet, packet_size)[0:packet_size]
+        parsed_packet = parse_array(packet, packet_size)[0:packet_size]
         packets_since = packets_since + 1
 
         a.set(parsed_packet)
