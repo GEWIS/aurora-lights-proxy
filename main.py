@@ -31,6 +31,11 @@ running = True
 sio = socketio.Client(logger=True)
 a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
 
+status_thread: Thread | None = None
+status_thread_running = False
+start_time = 0
+latency_ms = 0
+
 # Logging variables to track the incoming packets
 last_packet = datetime(2020, 7, 1)
 packets_since = 0
@@ -57,9 +62,48 @@ def parse_array(arr, desired_length):
 
         return padded_array
 
+def send_status_updates():
+    global status_thread_running, sio, latency_ms
+
+    while status_thread_running:
+        uptime_seconds = int(time.time() - start_time)
+        system_timestamp = math.floor(time.time_ns() / 1000000)
+        last_send_time = system_timestamp
+
+        def status_update_callback():
+            global latency_ms
+            callback_time = time.time_ns() / 1000000
+            rtt = callback_time - last_send_time
+            latency_ms = int(rtt / 2)
+            logging.info(f"Latency: {latency_ms} ms")
+
+        sio.emit('status:update', {
+            'uptimeSeconds': uptime_seconds,
+            'systemTimestamp': system_timestamp,
+            'latencyMilliseconds': latency_ms,
+        }, callback=status_update_callback)
+
+        time.sleep(5)
+
+def create_status_loop():
+    global status_thread, status_thread_running
+    status_thread_running = True
+    status_thread = Thread(target=send_status_updates)
+    status_thread.daemon = True
+    status_thread.start()
+
+def stop_status_loop():
+    global status_thread, status_thread_running
+    if status_thread is None:
+        return
+    status_thread_running = False
+    status_thread.join(timeout=1.0)
+    status_thread = None
 
 def main():
-    global sio, running, a, auth_cookie
+    global sio, running, start_time, a, auth_cookie
+
+    start_time = time.time()
 
     url = os.environ['URL'] + '/api/auth/key'
     result = requests.post(url, {'key': os.environ['API_KEY']})
@@ -85,6 +129,7 @@ def main():
         running = False
         a.stop()
         a.blackout()
+        stop_status_loop()
         sio.disconnect()
 
 @sio.event(namespace='/lights')
@@ -106,11 +151,13 @@ def dmx_packet(packet):
 def disconnect():
     a.stop()
     a.blackout()
+    stop_status_loop()
 
 @sio.event
 def connect():
     a.blackout()
     a.start()
+    create_status_loop()
 
 if __name__ == '__main__':
     while running:
