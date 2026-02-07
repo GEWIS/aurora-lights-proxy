@@ -7,6 +7,8 @@ import signal
 import requests
 import socketio
 import logging
+import math
+from threading import Thread
 from datetime import datetime
 
 load_dotenv()
@@ -25,20 +27,18 @@ packet_size = 512								# it is not necessary to send whole universe
 
 # Stop thread when necessary
 running = True
-# SocketIO exception
-crashed = False
-def stop_execution(signum, frame):
-    global running
-    running = False
 
-
-# When receiving an EXIT signal, try to stop the execution flow
-signal.signal(signal.SIGINT, stop_execution)
+sio = socketio.Client(logger=True)
+a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
 
 # Logging variables to track the incoming packets
 last_packet = datetime(2020, 7, 1)
 packets_since = 0
+auth_cookie = ''
 
+def get_headers():
+    global auth_cookie
+    return {'cookie': 'connect.sid=' + auth_cookie}
 
 def parse_array(arr, desired_length):
     int_arr = [max(min(int(x), 255), 0) for x in arr]
@@ -58,10 +58,8 @@ def parse_array(arr, desired_length):
         return padded_array
 
 
-def main_thread():
-    global running, crashed
-
-    crashed = False
+def main():
+    global sio, running, a, auth_cookie
 
     url = os.environ['URL'] + '/api/auth/key'
     result = requests.post(url, {'key': os.environ['API_KEY']})
@@ -73,62 +71,52 @@ def main_thread():
             json['details'] if json['details'] else json['message']),
         )
 
-    cookie = result.cookies.get('connect.sid')
-    a = StupidArtnet(target_ip, universe, packet_size, 40, True, True)
-    logging.info(a)
+    auth_cookie = result.cookies.get('connect.sid')
 
-    sio = socketio.Client()
-    sio.connect(os.environ['URL'], headers={'cookie': 'connect.sid=' + cookie},
-                namespaces=['/', '/lights'])
+    # Initialize SocketIO
+    sio.connect(os.environ['URL'], headers=get_headers, namespaces=['/', '/lights'])
 
-    # When connecting, always return all lights to black to return to the initial state
-    a.blackout()
-    a.start()
-    logging.info('Start listening...')
+    logging.info('Connected')
 
-    @sio.event(namespace='/lights')
-    @sio.event(namespace='/')
-    def dmx_packet(packet):
-        global packets_since, last_packet
+    try:
+        while running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        running = False
+        a.stop()
+        a.blackout()
+        sio.disconnect()
 
-        parsed_packet = parse_array(packet, packet_size)[0:packet_size]
-        packets_since = packets_since + 1
+@sio.event(namespace='/lights')
+def dmx_packet(packet):
+    global packets_since, last_packet
+    parsed_packet = parse_array(packet, packet_size)[0:packet_size]
+    packets_since += 1
+    a.set(parsed_packet)
+    now = datetime.now()
+    diff = now - last_packet
+    if diff.total_seconds() > 1:
+        first_fixture = parsed_packet[:16]
+        p = packets_since
+        logging.debug(f"Received {p:02} DMX packets since last log (last packet snippet: {first_fixture})")
+        packets_since = 0
+        last_packet = now
 
-        a.set(parsed_packet)
-
-        # Logging/debugging time
-        now = datetime.now()
-        diff = now - last_packet
-        if diff.total_seconds() > 1:
-            first_fixture = parsed_packet[:16]
-            p = packets_since
-            logging.debug(f"Received {p:02} DMX packets since last log (last packet snippet: {first_fixture})"
-                          .format(p=p, first_fixture=first_fixture))
-
-            # Reset logging variables
-            packets_since = 0
-            last_packet = now
-
-    @sio.event(namespace='/')
-    @sio.event(namespace='/lights')
-    def disconnect():
-        global crashed
-        crashed = True
-        raise Exception('Socket disconnect')
-
-    while running and not crashed:
-        time.sleep(1)
-
+@sio.event
+def disconnect():
     a.stop()
     a.blackout()
-    sio.disconnect()
 
+@sio.event
+def connect():
+    a.blackout()
+    a.start()
 
-while running:
-    try:
-        logging.info('Connecting...')
-        main_thread()
-    except Exception as e:
-        logging.error(traceback.format_exc())
-        logging.info('Something went wrong. Try again...')
-        time.sleep(5)
+if __name__ == '__main__':
+    while running:
+        try:
+            main()
+        except Exception as e:
+            logging.error(traceback.format_exc())
+            logging.info('Something went wrong. Retrying in 5 seconds...')
+            time.sleep(5)
