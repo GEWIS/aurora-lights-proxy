@@ -1,0 +1,43 @@
+[package]
+name = "aurora-lights-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Blazing-fast proxy that forwards DMX packets from Aurora core to an Art-Net controller"
+repository = "https://github.com/GEWIS/aurora-lights-proxy"
+readme = "README.md"
+publish = false
+keywords = ["dmx", "artnet", "socketio", "lights", "proxy"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+ctrlc = "3"
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "cookies", "rustls-tls"] }
+rust_socketio = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# rust_socketio pulls in native-tls, which on Linux needs OpenSSL. Vendor it
+# so cross-compile release builds (e.g. aarch64-unknown-linux-gnu) succeed
+# without requiring libssl-dev on the target's sysroot. macOS uses
+# SecureTransport and Windows uses SChannel, so openssl-sys isn't in their
+# dependency graph and this entry is skipped on those platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[lib]
+name = "aurora_lights_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurora-lights-proxy"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
