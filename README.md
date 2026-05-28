@@ -65,6 +65,15 @@ Aurora core <--Socket.IO--> aurora-lights-proxy <--UDP/Art-Net--> controller -->
 
 When the core disconnects or the process is interrupted, the proxy blacks out the universe and stops sending, so fixtures don't stay stuck on the last frame.
 
+### Recovery
+
+The proxy is built to ride through outages on its own. A manual restart should never be necessary.
+
+- Socket.IO reconnects automatically with a 1-60s exponential backoff (handled by `rust_socketio` under the hood). The proxy logs the disconnect, blacks out the universe, and waits for the reconnect to come through.
+- If a namespace stays disconnected for more than 45 seconds, the proxy tears down both clients, re-authenticates against `/api/auth/key`, and reopens the connections from scratch. This recovers from expired cookies and "stuck reconnect" states.
+- The outer retry loop uses 1, 2, 4, 8, 16, 32, 60s backoff (capped at 60s). The counter resets after 60s of continuous uptime so a long-running session that hiccups once doesn't get penalised.
+- Art-Net is fire-and-forget UDP, so we can't detect a powered-off controller from the application layer; the sender keeps emitting frames and they resume reaching the controller as soon as it's back. Local interface errors (`ENETUNREACH`, `EHOSTUNREACH`) are logged but never crash the sender thread.
+
 ## Testing
 
 ```bash

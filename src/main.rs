@@ -3,7 +3,7 @@ use rust_socketio::client::Client;
 use rust_socketio::{ClientBuilder, Event, Payload};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -11,6 +11,18 @@ use tracing::{debug, error, info, warn};
 use aurora_lights_proxy::artnet::ArtNetSender;
 use aurora_lights_proxy::config::Config;
 use aurora_lights_proxy::packet::parse_array;
+
+// If a namespace stays disconnected this long, tear down `run()` and let the
+// outer loop re-authenticate. rust_socketio reconnects on its own with a
+// 1-60s backoff, so 45s gives it plenty of attempts before we escalate.
+const DEAD_THRESHOLD: Duration = Duration::from_secs(45);
+
+// Reset the outer-loop backoff counter after this much continuous uptime.
+const STABLE_UPTIME: Duration = Duration::from_secs(60);
+
+// rust_socketio's built-in reconnect bounds (milliseconds).
+const RECONNECT_DELAY_MIN_MS: u64 = 1_000;
+const RECONNECT_DELAY_MAX_MS: u64 = 60_000;
 
 fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -27,27 +39,91 @@ fn main() -> Result<()> {
         .context("failed to register signal handler")?;
     }
 
+    let mut consecutive_failures: u32 = 0;
     while !stop.load(Ordering::SeqCst) {
+        let run_started = Instant::now();
         match run(&config, &stop) {
             Ok(()) => break,
             Err(e) => {
-                error!("Something went wrong: {e:#}");
+                error!("Run ended: {e:#}");
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                info!("Retrying in 5 seconds...");
-                for _ in 0..50 {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
+                if run_started.elapsed() >= STABLE_UPTIME {
+                    consecutive_failures = 0;
                 }
+                let delay = backoff(consecutive_failures);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                info!(
+                    "Retrying in {}s (attempt {consecutive_failures})...",
+                    delay.as_secs()
+                );
+                sleep_interruptible(delay, &stop);
             }
         }
     }
 
     info!("Goodbye");
     Ok(())
+}
+
+/// Exponential backoff capped at 60s: 1, 2, 4, 8, 16, 32, 60, 60, ...
+fn backoff(attempt: u32) -> Duration {
+    let shift = attempt.min(6);
+    let secs = (1u64 << shift).min(60);
+    Duration::from_secs(secs)
+}
+
+/// Sleep in 100ms chunks so Ctrl+C is responsive.
+fn sleep_interruptible(total: Duration, stop: &Arc<AtomicBool>) {
+    let mut remaining = total;
+    let step = Duration::from_millis(100);
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let chunk = remaining.min(step);
+        thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+}
+
+/// Per-namespace connection state. The flag tracks the latest event, the
+/// timestamp records when the flag last flipped -- together they let the
+/// watchdog tell "transient hiccup" from "stuck disconnected for too long".
+struct ConnState {
+    connected: AtomicBool,
+    last_change: Mutex<Instant>,
+}
+
+impl ConnState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            connected: AtomicBool::new(false),
+            last_change: Mutex::new(Instant::now()),
+        })
+    }
+
+    fn mark_connected(&self) {
+        self.connected.store(true, Ordering::SeqCst);
+        *self.last_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+        *self.last_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+
+    fn is_dead(&self, threshold: Duration) -> bool {
+        if self.connected.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.last_change
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .elapsed()
+            > threshold
+    }
 }
 
 fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
@@ -62,42 +138,79 @@ fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
     )?;
     let packet_size = config.packet_size as usize;
 
+    let lights_state = ConnState::new();
     let lights_artnet = artnet.clone();
+    let lights_on_connect = {
+        let s = Arc::clone(&lights_state);
+        let art = artnet.clone();
+        move |_: Payload, _: rust_socketio::RawClient| {
+            info!("Connected to /lights");
+            s.mark_connected();
+            // Re-blackout + restart on every (re)connect so the sender thread
+            // is alive and the buffer is in a known state.
+            art.blackout();
+            art.start();
+        }
+    };
+    let lights_on_close = {
+        let s = Arc::clone(&lights_state);
+        move |_: Payload, _: rust_socketio::RawClient| {
+            warn!("Lost /lights connection, rust_socketio will retry");
+            s.mark_disconnected();
+        }
+    };
     let lights_client = ClientBuilder::new(&config.url)
         .namespace("/lights")
         .opening_header("Cookie", cookie_header.clone())
+        .reconnect(true)
+        .reconnect_on_disconnect(true)
+        .reconnect_delay(RECONNECT_DELAY_MIN_MS, RECONNECT_DELAY_MAX_MS)
         .on("dmx_packet", move |payload, _| {
             handle_dmx(&lights_artnet, payload, packet_size);
         })
+        .on(Event::Connect, lights_on_connect)
+        .on(Event::Close, lights_on_close)
         .on(Event::Error, |err, _| {
-            error!("lights socket error: {err:?}")
+            error!("/lights socket error: {err:?}")
         })
         .connect()
         .context("failed to connect to /lights namespace")?;
 
-    let latency_ms = Arc::new(AtomicU64::new(0));
-    let start_time = Instant::now();
-
-    let connect_artnet = artnet.clone();
-    let disconnect_artnet = artnet.clone();
+    let main_state = ConnState::new();
+    let main_on_connect = {
+        let s = Arc::clone(&main_state);
+        move |_: Payload, _: rust_socketio::RawClient| {
+            info!("Connected to Aurora core");
+            s.mark_connected();
+        }
+    };
+    let main_on_close = {
+        let s = Arc::clone(&main_state);
+        let art = artnet.clone();
+        move |_: Payload, _: rust_socketio::RawClient| {
+            warn!("Lost connection to Aurora core, rust_socketio will retry");
+            s.mark_disconnected();
+            // Black out so the fixtures don't get stuck on whatever the last
+            // frame was during the outage.
+            art.blackout();
+        }
+    };
     let main_client = ClientBuilder::new(&config.url)
         .namespace("/")
         .opening_header("Cookie", cookie_header)
-        .on(Event::Connect, move |_, _| {
-            info!("Connected to Aurora core");
-            connect_artnet.blackout();
-            connect_artnet.start();
-        })
-        .on(Event::Close, move |_, _| {
-            info!("Disconnected from Aurora core");
-            disconnect_artnet.stop();
-            disconnect_artnet.blackout();
-        })
+        .reconnect(true)
+        .reconnect_on_disconnect(true)
+        .reconnect_delay(RECONNECT_DELAY_MIN_MS, RECONNECT_DELAY_MAX_MS)
+        .on(Event::Connect, main_on_connect)
+        .on(Event::Close, main_on_close)
         .on(Event::Error, |err, _| error!("core socket error: {err:?}"))
         .connect()
         .context("failed to connect to default namespace")?;
 
     let main_client = Arc::new(main_client);
+
+    let latency_ms = Arc::new(AtomicU64::new(0));
+    let start_time = Instant::now();
 
     let status_handle = {
         let main_client = Arc::clone(&main_client);
@@ -106,18 +219,33 @@ fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
         thread::spawn(move || status_loop(main_client, latency_ms, start_time, stop))
     };
 
-    while !stop.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(250));
-    }
+    // Health watchdog: tear down `run()` (and trigger the outer loop's re-auth)
+    // if either namespace stays disconnected past DEAD_THRESHOLD.
+    let result: Result<()> = loop {
+        if stop.load(Ordering::SeqCst) {
+            break Ok(());
+        }
+        if lights_state.is_dead(DEAD_THRESHOLD) {
+            break Err(anyhow::anyhow!(
+                "/lights stayed disconnected for >{DEAD_THRESHOLD:?}, re-authenticating"
+            ));
+        }
+        if main_state.is_dead(DEAD_THRESHOLD) {
+            break Err(anyhow::anyhow!(
+                "core stayed disconnected for >{DEAD_THRESHOLD:?}, re-authenticating"
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
 
-    info!("Stopping proxy");
+    info!("Tearing down clients");
     artnet.stop();
     artnet.blackout();
     let _ = main_client.disconnect();
     let _ = lights_client.disconnect();
     let _ = status_handle.join();
 
-    Ok(())
+    result
 }
 
 fn handle_dmx(artnet: &ArtNetSender, payload: Payload, packet_size: usize) {
@@ -186,15 +314,11 @@ fn status_loop(
             },
         );
         if let Err(e) = emit_result {
+            // Don't crash the loop -- the watchdog handles dead connections.
             warn!("status:update emit failed: {e:?}");
         }
 
-        for _ in 0..50 {
-            if stop.load(Ordering::SeqCst) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+        sleep_interruptible(Duration::from_secs(5), &stop);
     }
 }
 
@@ -202,6 +326,7 @@ fn authenticate(config: &Config) -> Result<String> {
     let url = format!("{}/api/auth/key", config.url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
         .cookie_store(true)
+        .timeout(Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
 
@@ -239,4 +364,52 @@ fn init_logging(level: &str) {
         .or_else(|_| EnvFilter::try_new(level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(backoff(0), Duration::from_secs(1));
+        assert_eq!(backoff(1), Duration::from_secs(2));
+        assert_eq!(backoff(2), Duration::from_secs(4));
+        assert_eq!(backoff(3), Duration::from_secs(8));
+        assert_eq!(backoff(4), Duration::from_secs(16));
+        assert_eq!(backoff(5), Duration::from_secs(32));
+        assert_eq!(backoff(6), Duration::from_secs(60));
+        // Caps from here on out
+        assert_eq!(backoff(7), Duration::from_secs(60));
+        assert_eq!(backoff(100), Duration::from_secs(60));
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn conn_state_starts_disconnected_but_fresh() {
+        let s = ConnState::new();
+        // Just-constructed state: not connected yet but timestamp is recent,
+        // so the watchdog gives it a grace window.
+        assert!(!s.is_dead(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn conn_state_dies_after_threshold() {
+        let s = ConnState::new();
+        s.mark_disconnected();
+        // Backdate last_change so the elapsed time exceeds the threshold.
+        *s.last_change.lock().unwrap() = Instant::now() - Duration::from_secs(10);
+        assert!(s.is_dead(Duration::from_secs(5)));
+        assert!(!s.is_dead(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn conn_state_alive_when_connected() {
+        let s = ConnState::new();
+        s.mark_disconnected();
+        *s.last_change.lock().unwrap() = Instant::now() - Duration::from_secs(120);
+        // Reconnect -- watchdog should immediately consider the link alive.
+        s.mark_connected();
+        assert!(!s.is_dead(Duration::from_secs(5)));
+    }
 }

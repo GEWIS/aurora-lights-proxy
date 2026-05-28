@@ -52,7 +52,7 @@ impl ArtNetSender {
     /// Replace the current DMX payload. Excess bytes are dropped and short
     /// payloads are padded with zeros.
     pub fn set(&self, data: &[u8]) {
-        let mut buf = self.inner.data.lock().expect("artnet data mutex poisoned");
+        let mut buf = lock_recover(&self.inner.data);
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         for byte in buf.iter_mut().skip(n) {
@@ -62,7 +62,7 @@ impl ArtNetSender {
 
     /// Set every channel to zero.
     pub fn blackout(&self) {
-        let mut buf = self.inner.data.lock().expect("artnet data mutex poisoned");
+        let mut buf = lock_recover(&self.inner.data);
         for byte in buf.iter_mut() {
             *byte = 0;
         }
@@ -91,12 +91,13 @@ impl ArtNetSender {
             );
 
             while inner.running.load(Ordering::SeqCst) {
-                let snapshot = {
-                    let buf = inner.data.lock().expect("artnet data mutex poisoned");
-                    buf.clone()
-                };
+                let snapshot = lock_recover(&inner.data).clone();
                 let frame = build_artnet_frame(inner.universe, 0, &snapshot);
                 if let Err(e) = inner.socket.send_to(&frame, inner.target) {
+                    // UDP send errors typically mean the local interface is
+                    // down (ENETUNREACH / EHOSTUNREACH). We can't tell from
+                    // here whether the controller itself failed -- when it
+                    // comes back, frames will flow again automatically.
                     warn!("Art-Net send failed: {e}");
                 }
                 thread::sleep(interval);
@@ -105,11 +106,7 @@ impl ArtNetSender {
             debug!("Art-Net loop stopped");
         });
 
-        *self
-            .inner
-            .handle
-            .lock()
-            .expect("artnet handle mutex poisoned") = Some(handle);
+        *lock_recover(&self.inner.handle) = Some(handle);
     }
 
     /// Stop the background thread and block until it exits.
@@ -117,13 +114,7 @@ impl ArtNetSender {
         if !self.inner.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        if let Some(handle) = self
-            .inner
-            .handle
-            .lock()
-            .expect("artnet handle mutex poisoned")
-            .take()
-        {
+        if let Some(handle) = lock_recover(&self.inner.handle).take() {
             let _ = handle.join();
         }
     }
@@ -137,6 +128,12 @@ impl Drop for Inner {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
     }
+}
+
+// Recover the inner value if the mutex was poisoned by a panicking thread.
+// We never want a single panic in a callback to wedge the proxy.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[cfg(test)]
