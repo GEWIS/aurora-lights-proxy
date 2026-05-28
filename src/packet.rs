@@ -13,7 +13,9 @@ pub const MAX_DMX_PAYLOAD: usize = 512;
 /// above 255 are saturated, and the resulting vector is padded with zeros when
 /// the source is shorter than the universe. Input values are accepted as i32 so
 /// that out-of-range numbers from the wire are clamped instead of overflowing.
+#[must_use]
 pub fn parse_array(input: &[i32], desired_length: usize) -> Vec<u8> {
+    #[allow(clippy::cast_sign_loss)] // value is clamped to 0..=255 before the cast
     let mut out: Vec<u8> = input.iter().map(|&x| x.clamp(0, 255) as u8).collect();
 
     if out.len() < desired_length {
@@ -25,13 +27,14 @@ pub fn parse_array(input: &[i32], desired_length: usize) -> Vec<u8> {
     out
 }
 
-/// Build an Art-Net OpDmx packet for the given universe and DMX payload.
+/// Build an Art-Net `OpDmx` packet for the given universe and DMX payload.
 ///
 /// `sequence` of 0 disables sequence tracking on the receiver. The returned
 /// vector contains the full 18-byte header followed by the data. Length is
 /// rounded up to an even number as required by the spec. Payloads longer than
 /// `MAX_DMX_PAYLOAD` are truncated so the length field can never overflow the
 /// 16-bit on-wire encoding.
+#[must_use]
 pub fn build_artnet_frame(universe: u16, sequence: u8, data: &[u8]) -> Vec<u8> {
     let payload = &data[..data.len().min(MAX_DMX_PAYLOAD)];
     let mut length = payload.len();
@@ -47,6 +50,7 @@ pub fn build_artnet_frame(universe: u16, sequence: u8, data: &[u8]) -> Vec<u8> {
     frame.push(0); // physical
     frame.push((universe & 0xFF) as u8);
     frame.push(((universe >> 8) & 0x7F) as u8);
+    #[allow(clippy::cast_possible_truncation)] // length ≤ MAX_DMX_PAYLOAD (512) always fits in u16
     frame.extend_from_slice(&(length as u16).to_be_bytes());
     frame.extend_from_slice(payload);
     if payload.len() != length {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -25,6 +25,9 @@ struct Inner {
 }
 
 impl ArtNetSender {
+    /// # Errors
+    ///
+    /// Returns an error if the UDP socket cannot be bound or configured for broadcast.
     pub fn new(target_ip: Ipv4Addr, universe: u16, packet_size: u16, fps: u32) -> Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .context("failed to bind UDP socket for Art-Net")?;
@@ -119,6 +122,7 @@ impl ArtNetSender {
         }
     }
 
+    #[must_use]
     pub fn packet_size(&self) -> u16 {
         self.inner.packet_size
     }
@@ -133,7 +137,7 @@ impl Drop for Inner {
 // Recover the inner value if the mutex was poisoned by a panicking thread.
 // We never want a single panic in a callback to wedge the proxy.
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

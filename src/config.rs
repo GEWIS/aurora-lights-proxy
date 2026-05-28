@@ -35,6 +35,10 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
+    /// # Errors
+    ///
+    /// Returns an error if any required env var is absent or if any value
+    /// fails validation (universe range, packet size, FPS).
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             url: env::var("URL").context("URL env var is required")?,

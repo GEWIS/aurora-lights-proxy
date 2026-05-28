@@ -3,7 +3,7 @@ use rust_socketio::client::Client;
 use rust_socketio::{ClientBuilder, Event, Payload};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -77,12 +77,11 @@ fn backoff(attempt: u32) -> Duration {
 /// Sleep in 100ms chunks so Ctrl+C is responsive.
 fn sleep_interruptible(total: Duration, stop: &Arc<AtomicBool>) {
     let mut remaining = total;
-    let step = Duration::from_millis(100);
     while remaining > Duration::ZERO {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let chunk = remaining.min(step);
+        let chunk = remaining.min(Duration::from_millis(100));
         thread::sleep(chunk);
         remaining = remaining.saturating_sub(chunk);
     }
@@ -106,12 +105,18 @@ impl ConnState {
 
     fn mark_connected(&self) {
         self.connected.store(true, Ordering::SeqCst);
-        *self.last_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+        *self
+            .last_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 
     fn mark_disconnected(&self) {
         self.connected.store(false, Ordering::SeqCst);
-        *self.last_change.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+        *self
+            .last_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 
     fn is_dead(&self, threshold: Duration) -> bool {
@@ -120,12 +125,13 @@ impl ConnState {
         }
         self.last_change
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .elapsed()
             > threshold
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
     let cookie = authenticate(config)?;
     let cookie_header = format!("connect.sid={cookie}");
@@ -171,7 +177,7 @@ fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
         .on(Event::Connect, lights_on_connect)
         .on(Event::Close, lights_on_close)
         .on(Event::Error, |err, _| {
-            error!("/lights socket error: {err:?}")
+            error!("/lights socket error: {err:?}");
         })
         .connect()
         .context("failed to connect to /lights namespace")?;
@@ -216,7 +222,7 @@ fn run(config: &Config, stop: &Arc<AtomicBool>) -> Result<()> {
         let main_client = Arc::clone(&main_client);
         let latency_ms = Arc::clone(&latency_ms);
         let stop = Arc::clone(stop);
-        thread::spawn(move || status_loop(main_client, latency_ms, start_time, stop))
+        thread::spawn(move || status_loop(&main_client, &latency_ms, start_time, &stop))
     };
 
     // Health watchdog: tear down `run()` (and trigger the outer loop's re-auth)
@@ -282,17 +288,16 @@ fn handle_dmx(artnet: &ArtNetSender, payload: Payload, packet_size: usize) {
 }
 
 fn status_loop(
-    client: Arc<Client>,
-    latency_ms: Arc<AtomicU64>,
+    client: &Arc<Client>,
+    latency_ms: &Arc<AtomicU64>,
     start_time: Instant,
-    stop: Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         let uptime_seconds = start_time.elapsed().as_secs();
         let system_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
 
         let payload = json!({
             "uptimeSeconds": uptime_seconds,
@@ -301,14 +306,14 @@ fn status_loop(
         });
 
         let send_time = Instant::now();
-        let latency_for_cb = Arc::clone(&latency_ms);
+        let latency_for_cb = Arc::clone(latency_ms);
         let emit_result = client.emit_with_ack(
             "status:update",
             payload,
             Duration::from_secs(2),
             move |_, _| {
                 let rtt = send_time.elapsed();
-                let half = (rtt.as_millis() as u64) / 2;
+                let half = u64::try_from(rtt.as_millis()).unwrap_or(0) / 2;
                 latency_for_cb.store(half, Ordering::Relaxed);
                 debug!("Latency: {half} ms");
             },
@@ -318,7 +323,7 @@ fn status_loop(
             warn!("status:update emit failed: {e:?}");
         }
 
-        sleep_interruptible(Duration::from_secs(5), &stop);
+        sleep_interruptible(Duration::from_secs(5), stop);
     }
 }
 
